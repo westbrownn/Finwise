@@ -1,5 +1,8 @@
-import { useState, useCallback, useRef } from "react";
+import { useState, useRef } from "react";
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
+import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
+
+GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
 
 const CATEGORIES = {
   eğlence: { label: "Eğlence", color: "#f97316", keywords: ["netflix", "spotify", "sinema", "oyun", "steam", "bilet", "konser", "bar", "gece", "eğlence"] },
@@ -30,6 +33,118 @@ const ASSET_RETURNS = {
 function calcOpportunityCost(amount, months, assetKey) {
   const rate = ASSET_RETURNS[assetKey].monthly;
   return amount * Math.pow(1 + rate, months) - amount;
+}
+
+const BANK_PATTERNS = [
+  { key: "garanti", label: "Garanti BBVA", detect: ["garanti", "garanti bbva"] },
+  { key: "isbank", label: "Is Bankasi", detect: ["turkiye is bankasi", "is bankasi", "iscep", "maximum"] },
+  { key: "yapikredi", label: "Yapi Kredi", detect: ["yapi kredi", "worldcard", "adios"] },
+];
+
+function normalizeText(value) {
+  return (value || "")
+    .toLowerCase()
+    .replace(/ı/g, "i")
+    .replace(/ğ/g, "g")
+    .replace(/ü/g, "u")
+    .replace(/ş/g, "s")
+    .replace(/ö/g, "o")
+    .replace(/ç/g, "c");
+}
+
+function detectBank(rawText) {
+  const normalized = normalizeText(rawText);
+  return BANK_PATTERNS.find((bank) => bank.detect.some((keyword) => normalized.includes(keyword))) || null;
+}
+
+function parseAmountTr(amountStr) {
+  if (!amountStr) return null;
+  const normalized = amountStr.replace(/\s/g, "").replace(/\./g, "").replace(",", ".");
+  const parsed = Number.parseFloat(normalized);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function parseDateStr(dateStr) {
+  const [day, month, year] = dateStr.split(/[./-]/);
+  if (!day || !month || !year) return new Date().toISOString().split("T")[0];
+  return `${year.padStart(4, "20")}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
+}
+
+function isIncomeLine(line) {
+  const normalized = normalizeText(line);
+  return ["maas", "eft gelen", "havale gelen", "odeme alindi", "iade", "faiz", "geri odeme"].some((k) => normalized.includes(k));
+}
+
+function parseTransactionsFromPdfText(rawText) {
+  const lines = rawText.split("\n").map((l) => l.trim()).filter(Boolean);
+  const txns = [];
+
+  for (const line of lines) {
+    const dateMatch = line.match(/(\d{2}[./-]\d{2}[./-]\d{2,4})/);
+    if (!dateMatch || isIncomeLine(line)) continue;
+
+    const amountMatches = line.match(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g);
+    if (!amountMatches || amountMatches.length === 0) continue;
+
+    const rawAmount = amountMatches[amountMatches.length - 1];
+    const parsedAmount = parseAmountTr(rawAmount);
+    if (parsedAmount === null) continue;
+
+    const spendAmount = Math.abs(parsedAmount);
+    if (spendAmount <= 0) continue;
+
+    const desc = line
+      .replace(dateMatch[0], "")
+      .replace(/-?\d{1,3}(?:\.\d{3})*,\d{2}/g, "")
+      .replace(/\b(TL|TRY|BORC|ALACAK|BAKIYE)\b/gi, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (!desc) continue;
+
+    txns.push({
+      desc,
+      amount: spendAmount,
+      cat: categorize(desc),
+      date: parseDateStr(dateMatch[0]),
+    });
+  }
+
+  return txns;
+}
+
+function parseGarantiTransactions(rawText) {
+  return parseTransactionsFromPdfText(rawText);
+}
+
+function parseIsBankTransactions(rawText) {
+  return parseTransactionsFromPdfText(rawText);
+}
+
+function parseYapiKrediTransactions(rawText) {
+  return parseTransactionsFromPdfText(rawText);
+}
+
+function parseBankStatement(rawText, bankKey) {
+  if (bankKey === "garanti") return parseGarantiTransactions(rawText);
+  if (bankKey === "isbank") return parseIsBankTransactions(rawText);
+  if (bankKey === "yapikredi") return parseYapiKrediTransactions(rawText);
+  return parseTransactionsFromPdfText(rawText);
+}
+
+async function extractPdfText(file) {
+  const buffer = await file.arrayBuffer();
+  const loadingTask = getDocument({ data: buffer });
+  const pdf = await loadingTask.promise;
+  const pages = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
+    const page = await pdf.getPage(pageNum);
+    const content = await page.getTextContent();
+    const pageText = content.items.map((item) => item.str || "").join(" ");
+    pages.push(pageText);
+  }
+
+  return pages.join("\n");
 }
 
 function parseText(raw) {
@@ -66,6 +181,9 @@ export default function App() {
   const [step, setStep] = useState("upload");
   const [transactions, setTransactions] = useState([]);
   const [pasteText, setPasteText] = useState("");
+  const [pdfError, setPdfError] = useState("");
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [detectedBank, setDetectedBank] = useState("");
   const [selectedAsset, setSelectedAsset] = useState("altin");
   const [months, setMonths] = useState(3);
   const [goalCategory, setGoalCategory] = useState("eğlence");
@@ -76,6 +194,33 @@ export default function App() {
 
   const useSample = () => { setTransactions(SAMPLE_DATA); setStep("analysis"); };
   const handlePaste = () => { const parsed = parseText(pasteText); if (parsed.length > 0) { setTransactions(parsed); setStep("analysis"); } };
+  const handlePdfUpload = async (event) => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    setPdfError("");
+    setPdfLoading(true);
+
+    try {
+      const rawText = await extractPdfText(file);
+      const bank = detectBank(rawText);
+      const parsed = parseBankStatement(rawText, bank?.key);
+
+      if (parsed.length === 0) {
+        setPdfError("PDF okundu ama islem satirlari ayrıştırılamadı. Farkli bir ekstre deneyin.");
+        return;
+      }
+
+      setDetectedBank(bank?.label || "Desteklenen banka disi");
+      setTransactions(parsed);
+      setStep("analysis");
+    } catch (error) {
+      setPdfError("PDF okunurken hata olustu. Dosyanin sifresiz oldugundan emin olun.");
+    } finally {
+      setPdfLoading(false);
+      event.target.value = "";
+    }
+  };
 
   const byCategory = Object.entries(transactions.reduce((acc, t) => { acc[t.cat] = (acc[t.cat] || 0) + t.amount; return acc; }, {})).map(([cat, total]) => ({ cat, total, ...CATEGORIES[cat] })).sort((a, b) => b.total - a.total);
   const totalSpend = transactions.reduce((s, t) => s + t.amount, 0);
@@ -114,6 +259,17 @@ export default function App() {
             </div>
             <div style={{ display: "grid", gap: 20, gridTemplateColumns: "1fr 1fr" }}>
               <div className="card">
+                <div style={{ fontSize: 13, color: "#38bdf8", fontWeight: 600, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.8px" }}>📄 PDF Yukle</div>
+                <p style={{ color: "#6b6890", fontSize: 13, marginBottom: 16 }}>Garanti, Is Bankasi ve Yapi Kredi ekstrelerini otomatik tara.</p>
+                <input ref={fileRef} type="file" accept="application/pdf" style={{ display: "none" }} onChange={handlePdfUpload} />
+                <button className="btn-primary" style={{ width: "100%", marginBottom: 12, opacity: pdfLoading ? 0.7 : 1 }} onClick={() => fileRef.current?.click()} disabled={pdfLoading}>
+                  {pdfLoading ? "PDF Cozumleniyor..." : "PDF Sec ve Analiz Et"}
+                </button>
+                <div style={{ fontSize: 12, color: "#a09cc0", marginBottom: 22 }}>
+                  Desteklenen bankalar: Garanti BBVA, Is Bankasi, Yapi Kredi
+                  {detectedBank ? ` • Son tespit: ${detectedBank}` : ""}
+                </div>
+                {pdfError ? <div style={{ fontSize: 12, color: "#f87171", marginBottom: 14 }}>{pdfError}</div> : null}
                 <div style={{ fontSize: 13, color: "#7c5ff5", fontWeight: 600, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.8px" }}>📋 Yapıştır</div>
                 <p style={{ color: "#6b6890", fontSize: 13, marginBottom: 16 }}>Banka ekstrenden harcamaları kopyalayıp buraya yapıştır</p>
                 <textarea rows={6} placeholder={"Netflix 189 TL\nYemeksepeti 450 TL\nShell Benzin 800 TL\n..."} value={pasteText} onChange={(e) => setPasteText(e.target.value)} />
