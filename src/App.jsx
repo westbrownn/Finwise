@@ -1,6 +1,7 @@
-import { useState, useRef } from "react";
+import { useEffect, useState, useRef } from "react";
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell } from "recharts";
 import { getDocument, GlobalWorkerOptions } from "pdfjs-dist";
+import { supabase } from "./supabaseClient";
 
 GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.mjs", import.meta.url).toString();
 
@@ -177,6 +178,10 @@ const SAMPLE_DATA = [
   { desc: "Uber", amount: 420, cat: "ulaşım" },
 ];
 
+function normalizeCategory(category) {
+  return CATEGORIES[category] ? category : "diğer";
+}
+
 export default function App() {
   const [step, setStep] = useState("upload");
   const [transactions, setTransactions] = useState([]);
@@ -190,10 +195,152 @@ export default function App() {
   const [goalTarget, setGoalTarget] = useState(30);
   const [points, setPoints] = useState(0);
   const [goalAccepted, setGoalAccepted] = useState(false);
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [user, setUser] = useState(null);
+  const [authMode, setAuthMode] = useState("signin");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [syncStatus, setSyncStatus] = useState("");
   const fileRef = useRef();
+  const isAuthed = Boolean(user);
 
-  const useSample = () => { setTransactions(SAMPLE_DATA); setStep("analysis"); };
-  const handlePaste = () => { const parsed = parseText(pasteText); if (parsed.length > 0) { setTransactions(parsed); setStep("analysis"); } };
+  const saveTransactionsToSupabase = async (userId, nextTransactions) => {
+    const rows = nextTransactions.map((txn) => ({
+      user_id: userId,
+      description: txn.desc,
+      amount: Number(txn.amount),
+      category: normalizeCategory(txn.cat),
+      transaction_date: txn.date || new Date().toISOString().split("T")[0],
+    }));
+
+    const { error: deleteError } = await supabase.from("transactions").delete().eq("user_id", userId);
+    if (deleteError) throw deleteError;
+    if (!rows.length) return;
+
+    const { error: insertError } = await supabase.from("transactions").insert(rows);
+    if (insertError) throw insertError;
+  };
+
+  const loadTransactionsFromSupabase = async (userId) => {
+    const { data, error } = await supabase
+      .from("transactions")
+      .select("description, amount, category, transaction_date")
+      .eq("user_id", userId)
+      .order("transaction_date", { ascending: false });
+
+    if (error) throw error;
+    return (data || []).map((row) => ({
+      desc: row.description || "Islem",
+      amount: Number(row.amount) || 0,
+      cat: normalizeCategory(row.category),
+      date: row.transaction_date || new Date().toISOString().split("T")[0],
+    })).filter((txn) => txn.amount > 0);
+  };
+
+  const applyTransactions = async (nextTransactions) => {
+    setTransactions(nextTransactions);
+    setStep("analysis");
+
+    if (!user) {
+      setSyncStatus("Giris yaparsan harcamalarin Supabase'e kaydedilir.");
+      return;
+    }
+
+    try {
+      await saveTransactionsToSupabase(user.id, nextTransactions);
+      setSyncStatus("Harcamalar Supabase ile senkronize edildi.");
+    } catch (error) {
+      setSyncStatus(`Kayit hatasi: ${error.message}`);
+    }
+  };
+
+  const useSample = async () => { await applyTransactions(SAMPLE_DATA); };
+  const handlePaste = async () => {
+    const parsed = parseText(pasteText);
+    if (parsed.length > 0) await applyTransactions(parsed);
+  };
+
+  const handleAuth = async () => {
+    setAuthError("");
+    setSyncStatus("");
+    setAuthLoading(true);
+
+    try {
+      if (authMode === "signup") {
+        const { error } = await supabase.auth.signUp({ email, password });
+        if (error) throw error;
+        setSyncStatus("Kayit basarili. E-posta dogrulama aciksa mailinizi onaylayin.");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email, password });
+        if (error) throw error;
+      }
+    } catch (error) {
+      setAuthError(error.message || "Kimlik dogrulama hatasi.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setTransactions([]);
+    setStep("upload");
+    setSyncStatus("Cikis yapildi.");
+  };
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const initAuth = async () => {
+      const { data, error } = await supabase.auth.getSession();
+      if (error || !isMounted) return;
+
+      const currentUser = data.session?.user || null;
+      setUser(currentUser);
+
+      if (currentUser) {
+        try {
+          const savedTransactions = await loadTransactionsFromSupabase(currentUser.id);
+          if (!isMounted) return;
+          setTransactions(savedTransactions);
+          if (savedTransactions.length > 0) setStep("analysis");
+          setSyncStatus("Onceki harcama verilerin yuklendi.");
+        } catch (loadError) {
+          if (!isMounted) return;
+          setSyncStatus(`Veri yukleme hatasi: ${loadError.message}`);
+        }
+      }
+    };
+
+    initAuth();
+
+    const { data: listener } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (!isMounted) return;
+
+      const nextUser = session?.user || null;
+      setUser(nextUser);
+
+      if (!nextUser) return;
+      try {
+        const savedTransactions = await loadTransactionsFromSupabase(nextUser.id);
+        if (!isMounted) return;
+        setTransactions(savedTransactions);
+        if (savedTransactions.length > 0) setStep("analysis");
+        setSyncStatus("Supabase verileri yuklendi.");
+      } catch (loadError) {
+        if (!isMounted) return;
+        setSyncStatus(`Veri yukleme hatasi: ${loadError.message}`);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
   const handlePdfUpload = async (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -212,8 +359,7 @@ export default function App() {
       }
 
       setDetectedBank(bank?.label || "Desteklenen banka disi");
-      setTransactions(parsed);
-      setStep("analysis");
+      await applyTransactions(parsed);
     } catch (error) {
       setPdfError("PDF okunurken hata olustu. Dosyanin sifresiz oldugundan emin olun.");
     } finally {
@@ -246,6 +392,12 @@ export default function App() {
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
           {step !== "upload" && (<><button style={{ padding: "10px 20px", borderRadius: 10, cursor: "pointer", fontSize: 14, fontWeight: 500, background: "transparent", color: "#6b6890", border: "none", fontFamily: "inherit" }} onClick={() => setStep("analysis")}>Analiz</button><button style={{ padding: "10px 20px", borderRadius: 10, cursor: "pointer", fontSize: 14, fontWeight: 500, background: "transparent", color: "#6b6890", border: "none", fontFamily: "inherit" }} onClick={() => setStep("goals")}>Hedefler</button></>)}
+          {isAuthed ? (
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              <span style={{ fontSize: 12, color: "#a09cc0" }}>{user.email}</span>
+              <button className="btn-secondary" style={{ padding: "8px 14px" }} onClick={handleSignOut}>Cikis Yap</button>
+            </div>
+          ) : null}
           {points > 0 && (<div style={{ background: "linear-gradient(135deg,#f59e0b,#f97316)", borderRadius: 20, padding: "6px 14px", fontSize: 13, fontWeight: 700 }}>⭐ {points} puan</div>)}
         </div>
       </header>
@@ -253,6 +405,29 @@ export default function App() {
       <main style={{ maxWidth: 960, margin: "0 auto", padding: "40px 24px" }}>
         {step === "upload" && (
           <div className="fade-up">
+            <div className="card" style={{ marginBottom: 20 }}>
+              <div style={{ fontSize: 13, color: "#22c55e", fontWeight: 600, marginBottom: 12, textTransform: "uppercase", letterSpacing: "0.8px" }}>🔐 Supabase Giris</div>
+              <p style={{ color: "#6b6890", fontSize: 13, marginBottom: 14 }}>
+                Email/sifre ile hesap olustur veya giris yap. Girisli kullanicinin harcamalari Supabase'de saklanir.
+              </p>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 10 }}>
+                <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" type="email" style={{ background: "#0d0c1a", border: "1px solid #2d2b55", borderRadius: 12, color: "#e8e6ff", padding: "12px 14px", fontSize: 13, outline: "none" }} />
+                <input value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Sifre" type="password" style={{ background: "#0d0c1a", border: "1px solid #2d2b55", borderRadius: 12, color: "#e8e6ff", padding: "12px 14px", fontSize: 13, outline: "none" }} />
+              </div>
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <button className="btn-primary" onClick={handleAuth} disabled={authLoading || !email || !password}>
+                  {authLoading ? "Isleniyor..." : authMode === "signup" ? "Kayit Ol" : "Giris Yap"}
+                </button>
+                <button className="btn-secondary" onClick={() => setAuthMode((prev) => (prev === "signup" ? "signin" : "signup"))}>
+                  {authMode === "signup" ? "Hesabim var" : "Hesap Olustur"}
+                </button>
+                <span style={{ fontSize: 12, color: isAuthed ? "#22c55e" : "#a09cc0" }}>
+                  {isAuthed ? "Giris yapildi" : "Misafir mod"}
+                </span>
+              </div>
+              {authError ? <div style={{ fontSize: 12, color: "#f87171", marginTop: 10 }}>{authError}</div> : null}
+              {syncStatus ? <div style={{ fontSize: 12, color: "#6b6890", marginTop: 10 }}>{syncStatus}</div> : null}
+            </div>
             <div style={{ textAlign: "center", marginBottom: 48 }}>
               <h1 style={{ fontFamily: "'Syne', sans-serif", fontSize: "clamp(32px,5vw,52px)", fontWeight: 800, lineHeight: 1.1, letterSpacing: "-2px", marginBottom: 16 }}>Paranı nereye<br /><span style={{ background: "linear-gradient(135deg,#7c5ff5,#5b8af5,#38bdf8)", WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent" }}>harcıyorsun?</span></h1>
               <p style={{ color: "#6b6890", fontSize: 16, maxWidth: 480, margin: "0 auto" }}>Banka ekstren veya harcamalarını yapıştır — sana fırsat maliyetini gösterelim.</p>
